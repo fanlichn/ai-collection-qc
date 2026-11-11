@@ -1,0 +1,44 @@
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: collection_qc
+      MYSQL_USER: qc
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Colombo
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes: ["mysql_data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      mysql: {condition: service_healthy}
+    ports: ["0.0.0.0:8080:8080"]
+    volumes: ["audio_data:/data/audio"]
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python3", "-m", "app.worker"]
+    env_file: .env
+    depends_on:
+      mysql: {condition: service_healthy}
+    volumes: ["audio_data:/data/audio", "hf_cache:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+volumes:
+  mysql_data:
+  audio_data:
+  hf_cache:

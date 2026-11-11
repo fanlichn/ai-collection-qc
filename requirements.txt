@@ -1,0 +1,11 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sqlalchemy==2.0.40
+pymysql==1.1.1
+pydantic-settings==2.9.1
+boto3==1.38.18
+faster-whisper==1.1.1
+openai==1.78.1
+python-multipart==0.0.20
+requests>=2.31,<3
+cryptography>=42,<46
