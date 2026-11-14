@@ -1,4 +1,3 @@
-from pathlib import Path
 from faster_whisper import WhisperModel
 from .config import settings
 

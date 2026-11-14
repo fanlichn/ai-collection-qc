@@ -1,34 +1,58 @@
-from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException, status
+from datetime import date, timedelta
+from calendar import monthrange
+from fastapi import FastAPI, Depends, Form, HTTPException, Query, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func, desc
-import secrets, os
-from .config import settings
+from sqlalchemy import select, func, desc, or_
+from .login import credentials_match, login_page, session_user, start_session, verify_origin
+from .config import COMPARISON_MODEL, settings
 from .db import Base, engine, get_db
-from .models import Recording, Transcript, Analysis, Employee
+from .models import Recording, Transcript, Analysis, Employee, TranscriptComparison
 from .oss import presigned_audio_url
+from .recording_audio import resolve_audio_key
+from .call_volume import employee_bindings, issue_labels, latest_analyses, recording_day, summarize_calls
+from .call_outcome import WAIT_MARKER, is_wait_recording
 
 app = FastAPI(title=settings.app_name, version='1.0.0')
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 Base.metadata.create_all(bind=engine)
 app.mount('/static', StaticFiles(directory='web'), name='static')
 
-def auth(credentials: HTTPBasicCredentials = Depends(security)):
-    user_ok = secrets.compare_digest(credentials.username, settings.admin_user)
-    pass_ok = secrets.compare_digest(credentials.password, settings.admin_password)
-    if not (user_ok and pass_ok):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid credentials', headers={'WWW-Authenticate':'Basic'})
-    return credentials.username
+def auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    unsafe = request.method not in ('GET', 'HEAD', 'OPTIONS')
+    if credentials and credentials_match(credentials.username, credentials.password):
+        if unsafe and 'origin' in request.headers:
+            verify_origin(request)
+        return credentials.username
+    user = session_user(request)
+    if user is None:
+        raise HTTPException(401, 'Not authenticated', headers={'WWW-Authenticate': 'Basic'})
+    if unsafe:
+        verify_origin(request)
+    return user
 
 @app.get('/healthz')
 def health(): return {'ok': True, 'service': settings.app_name}
 
 @app.get('/', response_class=HTMLResponse)
-def dashboard(_: str = Depends(auth)):
-    with open('web/index.html', encoding='utf-8') as f: return f.read()
+def dashboard(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    if session_user(request) is None and not (credentials and credentials_match(
+            credentials.username, credentials.password)):
+        return login_page()
+    with open('web/index.html', encoding='utf-8') as f:
+        return HTMLResponse(f.read(), headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/login')
+def login(request: Request, username: str = Form(max_length=256), password: str = Form(max_length=1024)):
+    verify_origin(request)
+    if not credentials_match(username, password):
+        return login_page(invalid=True)
+    response = RedirectResponse('/', status_code=303, headers={'Cache-Control': 'no-store'})
+    start_session(request, response)
+    return response
 
 
 def analysis_grade(analysis: Analysis | None):
@@ -41,28 +65,97 @@ def analysis_grade(analysis: Analysis | None):
 
 @app.get('/api/overview')
 def overview(_: str = Depends(auth), db: Session = Depends(get_db)):
+    eligible = ~func.lower(Recording.filename).contains(WAIT_MARKER)
     total = db.scalar(select(func.count(Recording.id))) or 0
-    completed = db.scalar(select(func.count(Recording.id)).where(Recording.status=='COMPLETED')) or 0
+    completed = db.scalar(select(func.count(Recording.id)).where(Recording.status=='COMPLETED', eligible)) or 0
     pending = db.scalar(select(func.count(Recording.id)).where(Recording.status.in_(['PENDING','DOWNLOADING','TRANSCRIBING','ANALYZING']))) or 0
     failed = db.scalar(select(func.count(Recording.id)).where(Recording.status=='FAILED')) or 0
     ungraded = (Analysis.model_name == 'rules-only') & (Analysis.score == 100)
-    avg = db.scalar(select(func.avg(Analysis.score)).where(~ungraded))
-    high = db.scalar(select(func.count(Analysis.id)).where(
+    avg = db.scalar(select(func.avg(Analysis.score)).join(Recording, Recording.id == Analysis.recording_id)
+                    .where(eligible, ~ungraded))
+    high = db.scalar(select(func.count(Analysis.id)).join(Recording, Recording.id == Analysis.recording_id).where(
+        eligible,
         Analysis.risk_level.in_(['HIGH','REVIEW']) | (ungraded & Analysis.human_review_required)
     )) or 0
     return {'total':total,'completed':completed,'pending':pending,'failed':failed,'avg_score':round(float(avg),1) if avg is not None else None,'review_count':high}
 
+def report_range(period: str, value: date):
+    start = value.replace(day=1) if period == 'month' else value
+    try:
+        end = start + timedelta(days=monthrange(start.year, start.month)[1] if period == 'month' else 1)
+    except OverflowError as exc:
+        raise HTTPException(422, 'Date is outside the supported report range') from exc
+    return start, end
+
+
+@app.get('/api/call-volume')
+def call_volume(period: str = Query(pattern=r'^(day|month)$'), value: date = Query(),
+                include_issues: bool = False, _: str = Depends(auth), db: Session = Depends(get_db)):
+    return summarize_calls(db, *report_range(period, value), include_issues=include_issues)
+
+
 @app.get('/api/recordings')
-def recordings(limit: int=100, _: str=Depends(auth), db: Session=Depends(get_db)):
-    rows = db.scalars(select(Recording).order_by(desc(Recording.created_at)).limit(min(limit,500))).all()
+def recordings(limit: int = Query(100, ge=1), q: str = Query('', max_length=200),
+               period: str = Query('day', pattern=r'^(day|month)$'), value: date | None = None,
+               employee: int | None = Query(None, ge=0), issue: str = Query('', max_length=500),
+               page: int | None = Query(None, ge=1, le=2147483647),
+               _: str = Depends(auth), db: Session = Depends(get_db)):
+    query = select(Recording)
+    keyword = q.strip()
+    if keyword:
+        comparison_text = select(TranscriptComparison.result['text'].as_string()).where(
+            TranscriptComparison.recording_id == Recording.id,
+            TranscriptComparison.status == 'COMPLETED',
+        ).scalar_subquery()
+        original_text = select(Transcript.text).where(
+            Transcript.recording_id == Recording.id,
+        ).order_by(Transcript.id.desc()).limit(1).scalar_subquery()
+        query = query.where(or_(
+            Recording.filename.contains(keyword, autoescape=True),
+            Recording.device_id.contains(keyword, autoescape=True),
+            func.coalesce(comparison_text, original_text).contains(keyword, autoescape=True),
+        ))
+    filtered_in_python = value is not None or bool(issue) or employee is not None
+    limit = min(limit, 500) if page is None else 20
+    offset = 0 if page is None else (page - 1) * limit
+    total = 0
+    if page is not None and not filtered_in_python:
+        total = db.scalar(select(func.count()).select_from(query.subquery()))
+    latest = latest_analyses()
+    query = query.add_columns(Analysis).outerjoin(latest, latest.c.recording_id == Recording.id).outerjoin(
+        Analysis, Analysis.id == latest.c.analysis_id).order_by(Recording.created_at.desc(), Recording.id.desc())
+    if value is not None:
+        start, end = report_range(period, value)
+    owners = employee_bindings(db)[1] if employee is not None else {}
+    if not filtered_in_python:
+        query = query.offset(offset).limit(limit)
     out=[]
-    for r in rows:
-        a=db.scalar(select(Analysis).where(Analysis.recording_id==r.id).order_by(desc(Analysis.id)).limit(1))
-        score, risk = analysis_grade(a)
+    for r, a in db.execute(query.execution_options(yield_per=1000)):
+        if value is not None and not start <= recording_day(
+                r.filename, r.object_key, r.last_modified, r.created_at) < end:
+            continue
+        if employee is not None:
+            candidates = owners.get(r.device_id, ())
+            owner = candidates[0] if len(candidates) == 1 else 0
+            if owner != employee:
+                continue
+        unanswered = is_wait_recording(r.filename)
+        if issue and (unanswered or issue not in issue_labels(a) or a.review_decision == 'REJECTED'):
+            continue
+        if page is not None and filtered_in_python:
+            total += 1
+            if total <= offset or len(out) == limit:
+                continue
+        score, risk = (None, None) if unanswered else analysis_grade(a)
         out.append({'id':r.id,'object_key':r.object_key,'device_id':r.device_id,'filename':r.filename,'size_bytes':r.size_bytes,
             'status':r.status,'language':r.detected_language,'score':score,'risk_level':risk,
+            'unanswered': unanswered,
             'created_at':r.created_at.isoformat() if r.created_at else None,'error':r.error})
-    return out
+        if len(out) == limit and page is None:
+            break
+    if page is None:
+        return out
+    return {'rows': out, 'page': page, 'total': total, 'pages': max(1, (total + limit - 1) // limit)}
 
 @app.get('/api/recordings/{recording_id}')
 def recording_detail(recording_id:int, _:str=Depends(auth), db:Session=Depends(get_db)):
@@ -70,9 +163,10 @@ def recording_detail(recording_id:int, _:str=Depends(auth), db:Session=Depends(g
     if not r: raise HTTPException(404,'Recording not found')
     t=db.scalar(select(Transcript).where(Transcript.recording_id==r.id).order_by(desc(Transcript.id)).limit(1))
     a=db.scalar(select(Analysis).where(Analysis.recording_id==r.id).order_by(desc(Analysis.id)).limit(1))
+    unanswered = is_wait_recording(r.filename)
     score, risk = analysis_grade(a)
     analysis = None
-    if a:
+    if a and not unanswered:
         summary = a.summary
         result = a.result
         if score is None:
@@ -80,7 +174,7 @@ def recording_detail(recording_id:int, _:str=Depends(auth), db:Session=Depends(g
             result = {**result, 'score': score, 'risk_level': risk, 'summary': summary}
         analysis = {'score':score,'risk_level':risk,'summary':summary,'result':result,
             'human_review_required':a.human_review_required,'review_decision':a.review_decision,'review_note':a.review_note}
-    return {'recording':{'id':r.id,'object_key':r.object_key,'device_id':r.device_id,'filename':r.filename,'status':r.status,'error':r.error,'language':r.detected_language,'duration_seconds':r.duration_seconds},
+    return {'recording':{'id':r.id,'object_key':r.object_key,'device_id':r.device_id,'filename':r.filename,'status':r.status,'error':r.error,'language':r.detected_language,'duration_seconds':r.duration_seconds,'unanswered':unanswered},
         'transcript':{'language':t.language,'text':t.text,'segments':t.segments} if t else None,
         'analysis':analysis}
 
@@ -88,8 +182,37 @@ def recording_detail(recording_id:int, _:str=Depends(auth), db:Session=Depends(g
 def recording_audio(recording_id:int, _:str=Depends(auth), db:Session=Depends(get_db)):
     r=db.get(Recording, recording_id)
     if not r: raise HTTPException(404,'Recording not found')
-    try: return {'url':presigned_audio_url(r.object_key, 300)}
-    except Exception as exc: raise HTTPException(502, f'OSS audio URL error: {exc}')
+    try:
+        return {'url': presigned_audio_url(resolve_audio_key(db, r), 300)}
+    except Exception as exc:
+        raise HTTPException(502, 'Recording audio unavailable') from exc
+
+
+@app.get('/api/recordings/{recording_id}/comparison')
+def get_comparison(recording_id: int, _: str = Depends(auth), db: Session = Depends(get_db)):
+    if db.get(Recording, recording_id) is None:
+        raise HTTPException(404, 'Recording not found')
+    job = db.get(TranscriptComparison, recording_id)
+    return {'model': COMPARISON_MODEL, 'status': job.status if job else 'NOT_STARTED',
+            'result': job.result if job else None}
+
+
+@app.post('/api/recordings/{recording_id}/comparison', status_code=202)
+def start_comparison(recording_id: int, _: str = Depends(auth), db: Session = Depends(get_db)):
+    recording = db.get(Recording, recording_id, with_for_update=True)
+    if recording is None:
+        raise HTTPException(404, 'Recording not found')
+    if (recording.status != 'COMPLETED' or is_wait_recording(recording.filename)
+            or recording.size_bytes > settings.max_audio_mb * 1024 * 1024):
+        raise HTTPException(409, 'Recording is not eligible for comparison')
+    job = db.get(TranscriptComparison, recording_id)
+    if job is None:
+        job = TranscriptComparison(recording_id=recording_id, status='PENDING')
+        db.add(job)
+    elif job.status == 'FAILED':
+        job.status = 'PENDING'
+    db.commit()
+    return {'status': job.status}
 
 @app.post('/api/recordings/{recording_id}/retry')
 def retry_recording(recording_id:int, _:str=Depends(auth), db:Session=Depends(get_db)):
@@ -100,6 +223,9 @@ def retry_recording(recording_id:int, _:str=Depends(auth), db:Session=Depends(ge
 
 @app.post('/api/recordings/{recording_id}/review')
 def review(recording_id:int, payload:dict, user:str=Depends(auth), db:Session=Depends(get_db)):
+    recording = db.get(Recording, recording_id)
+    if recording and is_wait_recording(recording.filename):
+        raise HTTPException(409, 'Waiting recordings are excluded from quality review')
     a=db.scalar(select(Analysis).where(Analysis.recording_id==recording_id).order_by(desc(Analysis.id)).limit(1))
     if not a: raise HTTPException(404,'Analysis not found')
     decision=payload.get('decision')
@@ -126,6 +252,6 @@ def export_csv(_:str=Depends(auth), db:Session=Depends(get_db)):
     buf=io.StringIO(); w=csv.writer(buf); w.writerow(['id','object_key','device_id','filename','status','language','score','risk_level','created_at'])
     for r in db.scalars(select(Recording).order_by(desc(Recording.created_at))).all():
         a=db.scalar(select(Analysis).where(Analysis.recording_id==r.id).order_by(desc(Analysis.id)).limit(1))
-        score, risk = analysis_grade(a)
+        score, risk = (None, None) if is_wait_recording(r.filename) else analysis_grade(a)
         w.writerow([r.id,r.object_key,r.device_id,r.filename,r.status,r.detected_language,score,risk,r.created_at])
     return StreamingResponse(iter([buf.getvalue()]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=qc-recordings.csv'})

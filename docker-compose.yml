@@ -24,7 +24,9 @@ services:
     ports: ["0.0.0.0:8080:8080"]
     volumes: ["audio_data:/data/audio"]
   worker:
-    build: .
+    build:
+      context: .
+      target: worker
     restart: unless-stopped
     command: ["python3", "-m", "app.worker"]
     env_file: .env

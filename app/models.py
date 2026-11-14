@@ -43,6 +43,15 @@ class Analysis(Base):
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class TranscriptComparison(Base):
+    __tablename__ = 'qc_qwen_transcripts'
+    recording_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    claim: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Employee(Base):
     __tablename__ = 'qc_employees'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

@@ -10,7 +10,7 @@
 - OSS 分页扫描、对象去重、录音下载
 - faster-whisper 自动语言检测（Sinhala / English / Tamil / Chinese 由 Whisper 自动检测）
 - 逐段时间戳转录
-- 规则初筛；可选 OpenAI-compatible LLM JSON 分析
+- 规则初筛与可选 DeepSeek 语义质检。配置 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 和 `DEEPSEEK_API_KEY` 后，新任务会发送转录文字进行分析。
 - 评分、风险队列、人工复核、OSS 短时签名 URL 录音播放、失败任务手动重试
 - Web 看板、录音列表、转录详情、员工-设备绑定、CSV 导出
 - MySQL 持久化、数据库轮询任务队列，Docker Compose 部署
@@ -35,7 +35,7 @@ unzip ai-collection-qc-mvp.zip
 cd ai-collection-qc
 cp .env.example .env
 nano .env
-# 必须填写密码、OSS RAM Key；若需语义分析，再填 OpenAI-compatible API 三项
+# 必须填写密码和 OSS RAM Key。启用语义质检时再填写 DeepSeek 配置。
 
 docker compose build
 # 先验证 GPU 容器可见性

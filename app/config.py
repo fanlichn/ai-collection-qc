@@ -1,5 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+COMPARISON_MODEL = 'Qwen/Qwen3-ASR-1.7B'
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
     app_name: str = 'AI Collection QA'
@@ -20,9 +22,9 @@ class Settings(BaseSettings):
     whisper_compute_type: str = 'float16'
     whisper_beam_size: int = 5
     whisper_language: str = ''  # blank = auto detect; si/en/ta/zh supported by Whisper
-    openai_base_url: str = ''
-    openai_api_key: str = ''
-    openai_model: str = ''
+    deepseek_base_url: str = 'https://api.deepseek.com'
+    deepseek_api_key: str = ''
+    deepseek_model: str = 'deepseek-flash'
     max_audio_mb: int = 200
     worker_poll_seconds: int = 10
     cors_origins: str = ''
